@@ -71,3 +71,4 @@ desktop.ini
 .env
 .env.*
 secrets.json
+.claude
