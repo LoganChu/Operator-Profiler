@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(cd:*)",
-      "Bash(conda run:*)"
+      "Bash(conda run:*)",
+      "Bash(python -c \":*)",
+      "Bash(for dir:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/s-lch/OneDrive - Duke University/Yotta Labs/Operator-Profiler/**)",
+      "Bash(grep -E \"\\\\.py$|^total|^d\")",
+      "Bash(done)"
     ]
   }
 }

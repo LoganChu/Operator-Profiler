@@ -3,7 +3,7 @@ import argparse
 import logging
 import sys
 
-from . import map_cmd, profile_cmd, report_cmd
+from . import map_cmd, profile_cmd, report_cmd, summarize_cmd, explain_cmd
 
 
 def main() -> None:
@@ -21,6 +21,8 @@ def main() -> None:
     profile_cmd.add_parser(subparsers)
     map_cmd.add_parser(subparsers)
     report_cmd.add_parser(subparsers)
+    summarize_cmd.add_parser(subparsers)
+    explain_cmd.add_parser(subparsers)
 
     args = parser.parse_args()
     args.func(args)

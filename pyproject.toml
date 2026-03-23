@@ -16,6 +16,9 @@ dev = [
     "pytest>=8.0",
     "pytest-mock",
 ]
+rich = [
+    "rich>=13.0",
+]
 
 [project.scripts]
 operator-profiler = "operator_profiler.cli:main"
