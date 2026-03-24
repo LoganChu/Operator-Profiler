@@ -88,6 +88,8 @@ def _make_loop(
     mock_planner.plan.side_effect = (
         planner_plan_fn if planner_plan_fn else lambda *a, **kw: RewritePlan()
     )
+    # rank_candidates passes candidates through unchanged (no API call in tests)
+    mock_planner.rank_candidates.side_effect = lambda profile, candidates, **kw: candidates
 
     profiler_fn = MagicMock()
     profiler_fn.return_value = (
@@ -226,3 +228,23 @@ def test_loop_planner_called_n_times_per_iteration(tmp_path):
     loop.run(_make_gm(), initial_profile, [torch.ones(1)])
     # beam_width=3, 1 iteration → planner called 3 times
     assert loop._planner.plan.call_count == 3
+
+
+def test_loop_calls_rank_candidates_each_iteration(tmp_path):
+    """rank_candidates is called once per iteration to re-rank broad_search results."""
+    n = 2
+    loop, initial_profile = _make_loop(tmp_path, n_iterations=n)
+    loop.run(_make_gm(), initial_profile, [torch.ones(1)])
+    assert loop._planner.rank_candidates.call_count == n
+
+
+def test_loop_uses_broad_search_not_narrow_search(tmp_path):
+    """Loop calls broad_search (no bottleneck filter) rather than the legacy search."""
+    loop, initial_profile = _make_loop(tmp_path, n_iterations=1)
+    # Patch both search methods so we can distinguish which was called
+    from unittest.mock import patch
+    with patch.object(loop._memory, "broad_search", wraps=loop._memory.broad_search) as mock_broad, \
+         patch.object(loop._memory, "search", wraps=loop._memory.search) as mock_narrow:
+        loop.run(_make_gm(), initial_profile, [torch.ones(1)])
+    assert mock_broad.call_count >= 1
+    assert mock_narrow.call_count == 0

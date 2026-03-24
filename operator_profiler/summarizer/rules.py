@@ -1,6 +1,13 @@
 """
 OptimizationRule generation — distills MemoryEntry records into
 human-readable rules for the Lessons Learned section.
+
+Optional RuleAgent enrichment
+------------------------------
+Pass ``rule_agent=RuleAgent(...)`` to ``entry_to_rule()`` or
+``entries_to_rules()`` to replace the string-template rule_text with a
+causal, LLM-generated explanation.  Falls back to the template on any
+API error.
 """
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ from typing import TYPE_CHECKING
 from operator_profiler.summarizer.schema import OptimizationRule
 
 if TYPE_CHECKING:
+    from operator_profiler.agents.rule import RuleAgent
     from operator_profiler.planner.schema import MemoryEntry
 
 # Bottleneck → list of human-readable threshold conditions
@@ -29,8 +37,22 @@ _CONDITIONS: dict[str, list[str]] = {
 }
 
 
-def entry_to_rule(entry: "MemoryEntry") -> OptimizationRule:
-    """Convert a single MemoryEntry into a human-readable OptimizationRule."""
+def entry_to_rule(
+    entry: "MemoryEntry",
+    rule_agent: "RuleAgent | None" = None,
+) -> OptimizationRule:
+    """
+    Convert a single MemoryEntry into a human-readable OptimizationRule.
+
+    Parameters
+    ----------
+    entry:
+        Source memory entry.
+    rule_agent:
+        Optional RuleAgent.  When provided, the template rule_text,
+        conditions, and recommended_action are replaced with richer,
+        causal LLM-generated text.  Falls back to the template on error.
+    """
     op_pattern = entry.graph_pattern.op_sequence
     rewrite_op_summary = "; ".join(
         _summarise_rewrite_op(op) for op in entry.rewrite_plan.ops
@@ -47,7 +69,7 @@ def entry_to_rule(entry: "MemoryEntry") -> OptimizationRule:
         rewrite_op_summary=rewrite_op_summary,
         speedup_pct=speedup_pct,
     )
-    return OptimizationRule(
+    rule = OptimizationRule(
         entry_id=entry.entry_id,
         op_pattern=op_pattern,
         bottleneck=entry.bottleneck,
@@ -60,12 +82,16 @@ def entry_to_rule(entry: "MemoryEntry") -> OptimizationRule:
         created_at=entry.created_at,
         rule_text=rule_text,
     )
+    if rule_agent is not None:
+        rule = rule_agent.enrich_rule(entry, rule)
+    return rule
 
 
 def entries_to_rules(
     entries: "list[MemoryEntry]",
     sort_by: str = "speedup",
     top_n: int | None = None,
+    rule_agent: "RuleAgent | None" = None,
 ) -> list[OptimizationRule]:
     """Convert a list of MemoryEntry records to OptimizationRules.
 
@@ -77,8 +103,10 @@ def entries_to_rules(
         ``"speedup"`` (default) or ``"created_at"`` (ISO 8601 lexicographic).
     top_n:
         If provided, return only the top N rules after sorting.
+    rule_agent:
+        Optional RuleAgent passed through to each ``entry_to_rule()`` call.
     """
-    rules = [entry_to_rule(e) for e in entries]
+    rules = [entry_to_rule(e, rule_agent=rule_agent) for e in entries]
     if sort_by == "speedup":
         rules.sort(key=lambda r: r.speedup, reverse=True)
     elif sort_by == "created_at":

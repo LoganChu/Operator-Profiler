@@ -218,3 +218,142 @@ def test_planner_raises_on_missing_anthropic_package():
     with patch.dict("sys.modules", {"anthropic": None}):
         with pytest.raises(ImportError, match="anthropic package is required"):
             ThetaPlanner()
+
+
+# ---------------------------------------------------------------------------
+# rank_candidates
+# ---------------------------------------------------------------------------
+
+def _make_candidates(entry_ids: list[str]) -> list[SearchCandidate]:
+    """Build a list of SearchCandidates with the given entry IDs."""
+    from operator_profiler.planner.memory import _make_pattern_hash
+    result = []
+    for eid in entry_ids:
+        entry = MemoryEntry(
+            entry_id=eid,
+            graph_pattern=GraphPattern(
+                op_sequence=["aten::linear"],
+                pattern_hash=_make_pattern_hash(["aten::linear"]),
+            ),
+            bottleneck="memory_bound",
+            rewrite_plan=RewritePlan(),
+            speedup=1.2,
+            created_at="2026-03-21T00:00:00+00:00",
+        )
+        result.append(SearchCandidate(entry=entry, similarity=0.8))
+    return result
+
+
+def _make_rank_response(ranked_ids: list[str]) -> MagicMock:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "rank_memory_candidates"
+    block.input = {"ranked_ids": ranked_ids, "reasoning": "top choice is most similar"}
+    response = MagicMock()
+    response.content = [block]
+    return response
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_reorders_by_llm_output(mock_build_client):
+    """rank_candidates reorders candidates according to the LLM's ranked_ids."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+    mock_client.messages.create.return_value = _make_rank_response(["b", "a"])
+
+    planner = ThetaPlanner()
+    candidates = _make_candidates(["a", "b"])
+    result = planner.rank_candidates(_make_profile(), candidates)
+
+    assert [c.entry.entry_id for c in result] == ["b", "a"]
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_single_entry_skips_api(mock_build_client):
+    """With only 1 candidate, no API call is made and the list is returned as-is."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+
+    planner = ThetaPlanner()
+    candidates = _make_candidates(["only"])
+    result = planner.rank_candidates(_make_profile(), candidates)
+
+    mock_client.messages.create.assert_not_called()
+    assert result == candidates
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_empty_list_skips_api(mock_build_client):
+    """Empty candidate list is returned immediately without API call."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+
+    planner = ThetaPlanner()
+    result = planner.rank_candidates(_make_profile(), [])
+
+    mock_client.messages.create.assert_not_called()
+    assert result == []
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_api_failure_falls_back_to_original_order(mock_build_client):
+    """On API error, rank_candidates returns the original order unchanged."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+    mock_client.messages.create.side_effect = RuntimeError("timeout")
+
+    planner = ThetaPlanner()
+    candidates = _make_candidates(["x", "y", "z"])
+    result = planner.rank_candidates(_make_profile(), candidates)
+
+    assert [c.entry.entry_id for c in result] == ["x", "y", "z"]
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_partial_ids_appends_unmentioned(mock_build_client):
+    """IDs not mentioned by the LLM are appended at the end."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+    # LLM only mentions "b" and "c", not "a"
+    mock_client.messages.create.return_value = _make_rank_response(["b", "c"])
+
+    planner = ThetaPlanner()
+    candidates = _make_candidates(["a", "b", "c"])
+    result = planner.rank_candidates(_make_profile(), candidates)
+
+    ids = [c.entry.entry_id for c in result]
+    assert ids[:2] == ["b", "c"]
+    assert "a" in ids
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_no_tool_use_block_falls_back(mock_build_client):
+    """Response with no tool_use block returns original order."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+    response = MagicMock()
+    response.content = []
+    mock_client.messages.create.return_value = response
+
+    planner = ThetaPlanner()
+    candidates = _make_candidates(["p", "q"])
+    result = planner.rank_candidates(_make_profile(), candidates)
+
+    assert [c.entry.entry_id for c in result] == ["p", "q"]
+
+
+@patch("operator_profiler.planner.planner.ThetaPlanner._build_client")
+def test_rank_candidates_uses_rank_tool_not_rewrite_tool(mock_build_client):
+    """rank_candidates must call rank_memory_candidates, not produce_rewrite_plan."""
+    mock_client = MagicMock()
+    mock_build_client.return_value = mock_client
+    mock_client.messages.create.return_value = _make_rank_response(["a", "b"])
+
+    planner = ThetaPlanner()
+    planner.rank_candidates(_make_profile(), _make_candidates(["a", "b"]))
+
+    call_kwargs = mock_client.messages.create.call_args[1]
+    tool_names = [t["name"] for t in call_kwargs["tools"]]
+    assert "rank_memory_candidates" in tool_names
+    assert "produce_rewrite_plan" not in tool_names
+    assert call_kwargs["tool_choice"]["name"] == "rank_memory_candidates"

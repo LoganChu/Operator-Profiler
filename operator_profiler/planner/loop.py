@@ -36,6 +36,7 @@ from operator_profiler.planner.search import BeamSearch
 
 if TYPE_CHECKING:
     import torch.fx
+    from operator_profiler.agents.verifier import VerifierAgent
     from operator_profiler.schema.profile import OperatorAttributedProfile
 
 logger = logging.getLogger(__name__)
@@ -133,12 +134,14 @@ class OptimizationLoop:
         search: BeamSearch,
         profiler_fn: "Callable[[torch.fx.GraphModule], OperatorAttributedProfile]",
         config: LoopConfig | None = None,
+        verifier_agent: "VerifierAgent | None" = None,
     ) -> None:
         self._planner = planner
         self._memory = memory
         self._search = search
         self._profiler_fn = profiler_fn
         self._config = config or LoopConfig()
+        self._verifier_agent = verifier_agent
 
     def run(
         self,
@@ -179,7 +182,8 @@ class OptimizationLoop:
             pattern = self._memory.extract_pattern(current_profile)
             bottleneck = _worst_bottleneck(current_profile)
             worst_op_id = _worst_operator_id(current_profile)
-            candidates = self._memory.search(pattern, bottleneck, top_k=3)
+            candidates = self._memory.broad_search(pattern, top_k=15)
+            candidates = self._planner.rank_candidates(current_profile, candidates)
 
             n_explore, n_refine = self._search.partition_strategies(
                 len(candidates), iteration
@@ -199,7 +203,7 @@ class OptimizationLoop:
                         gm, current_profile, ctx_candidates, strategy=strategy
                     )
 
-                    # Apply & verify
+                    # Apply & verify — with one VerifierAgent-guided repair retry
                     try:
                         executor = HybridExecutor(gm, plan, cfg.executor_config)
                         result_gm, ver_results = executor.run()
@@ -210,10 +214,35 @@ class OptimizationLoop:
                         continue
 
                     if not all(v.passed for v in ver_results):
-                        logger.debug("Verification failed for plan — skipping")
-                        iter_plans_tried += 1
-                        total_trials += 1
-                        continue
+                        if self._verifier_agent is not None:
+                            repair_ctx = self._verifier_agent.diagnose(plan, ver_results)
+                            logger.debug(
+                                "VerifierAgent: %s — retrying with repair context",
+                                repair_ctx.failure_category,
+                            )
+                            plan = self._planner.plan(
+                                gm,
+                                current_profile,
+                                ctx_candidates,
+                                strategy=strategy,
+                                repair_context=repair_ctx.to_prompt_section(),
+                            )
+                            try:
+                                executor = HybridExecutor(gm, plan, cfg.executor_config)
+                                result_gm, ver_results = executor.run()
+                            except Exception as exc:
+                                logger.debug(
+                                    "Repair retry executor raised %s — skipping plan", exc
+                                )
+                                iter_plans_tried += 1
+                                total_trials += 1
+                                continue
+
+                        if not all(v.passed for v in ver_results):
+                            logger.debug("Verification failed for plan — skipping")
+                            iter_plans_tried += 1
+                            total_trials += 1
+                            continue
 
                     # Profile the rewritten model
                     try:

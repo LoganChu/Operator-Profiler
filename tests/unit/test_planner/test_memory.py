@@ -242,3 +242,70 @@ def test_worst_bottleneck_no_aggregated():
         operators=[OperatorRecord(operator_id="x", operator_name="aten::relu", call_index=0)],
     )
     assert _worst_bottleneck(profile) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# broad_search
+# ---------------------------------------------------------------------------
+
+def test_broad_search_empty_memory(tmp_path):
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    pattern = GraphPattern(op_sequence=["aten::linear"], pattern_hash="aaa")
+    assert mem.broad_search(pattern) == []
+
+
+def test_broad_search_returns_all_bottleneck_classes(tmp_path):
+    """broad_search must NOT filter by bottleneck — all classes returned."""
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    for bottleneck in ("memory_bound", "compute_bound", "latency_bound"):
+        mem._store.entries.append(_make_entry(["aten::conv2d"], bottleneck=bottleneck))
+
+    pattern = GraphPattern(op_sequence=["aten::conv2d"], pattern_hash="x")
+    results = mem.broad_search(pattern, top_k=10)
+    bottlenecks_returned = {r.entry.bottleneck for r in results}
+    assert bottlenecks_returned == {"memory_bound", "compute_bound", "latency_bound"}
+
+
+def test_broad_search_ranked_by_jaccard(tmp_path):
+    """Candidates with higher Jaccard similarity appear first."""
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    # exact match
+    mem._store.entries.append(_make_entry(["aten::conv2d", "aten::relu"], bottleneck="memory_bound"))
+    # partial match
+    mem._store.entries.append(_make_entry(["aten::sigmoid"], bottleneck="compute_bound"))
+
+    pattern = GraphPattern(op_sequence=["aten::conv2d", "aten::relu"], pattern_hash="x")
+    results = mem.broad_search(pattern, top_k=5)
+    assert results[0].similarity >= results[1].similarity
+    assert results[0].entry.graph_pattern.op_sequence == ["aten::conv2d", "aten::relu"]
+
+
+def test_broad_search_respects_top_k(tmp_path):
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    for i in range(10):
+        mem._store.entries.append(_make_entry([f"aten::op{i}"], bottleneck="memory_bound"))
+    pattern = GraphPattern(op_sequence=["aten::op0"], pattern_hash="x")
+    results = mem.broad_search(pattern, top_k=4)
+    assert len(results) == 4
+
+
+def test_broad_search_secondary_sort_by_speedup(tmp_path):
+    """When Jaccard ties, higher speedup comes first."""
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    # Both are exact matches → same Jaccard; differ by speedup
+    e_low = _make_entry(["aten::linear"], bottleneck="memory_bound", speedup=1.05)
+    e_high = _make_entry(["aten::linear"], bottleneck="compute_bound", speedup=1.80)
+    mem._store.entries.extend([e_low, e_high])
+
+    pattern = GraphPattern(op_sequence=["aten::linear"], pattern_hash="x")
+    results = mem.broad_search(pattern, top_k=2)
+    assert results[0].entry.speedup == pytest.approx(1.80)
+
+
+def test_broad_search_returns_list_of_search_candidates(tmp_path):
+    from operator_profiler.planner.schema import SearchCandidate
+    mem = OptimizationMemory(tmp_path / "opt.json")
+    mem._store.entries.append(_make_entry(["aten::relu"], bottleneck="latency_bound"))
+    pattern = GraphPattern(op_sequence=["aten::relu"], pattern_hash="x")
+    results = mem.broad_search(pattern, top_k=5)
+    assert all(isinstance(r, SearchCandidate) for r in results)
