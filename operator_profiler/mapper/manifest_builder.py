@@ -217,6 +217,11 @@ class ManifestBuilder:
         forest: NvtxIntervalForest,
         provenance: dict[str, dict],
     ) -> KernelAttribution:
+        # NVTX_EVENTS rows are keyed by host globalTid, not GPU streamId.
+        # Use host_tid from the RUNTIME join; fall back to stream_id for older
+        # exports that lack a RUNTIME table.
+        nvtx_tid = kr.host_tid if kr.host_tid else kr.stream_id
+
         # --- Priority 1: provenance sidecar (high confidence) ---
         prov = provenance.get(kr.kernel_name)
         if prov:
@@ -231,7 +236,7 @@ class ManifestBuilder:
                 )
                 for loc in raw_locs
             ]
-            all_ranges = forest.query_enclosing(kr.stream_id, kr.device_id, kr.start_ns)
+            all_ranges = forest.query_enclosing(nvtx_tid, kr.device_id, kr.start_ns)
             innermost = all_ranges[-1] if all_ranges else None
             return KernelAttribution(
                 method=AttributionMethod.PROVENANCE,
@@ -244,7 +249,7 @@ class ManifestBuilder:
             )
 
         # --- Priority 2: NVTX enclosure (medium confidence) ---
-        all_ranges = forest.query_enclosing(kr.stream_id, kr.device_id, kr.start_ns)
+        all_ranges = forest.query_enclosing(nvtx_tid, kr.device_id, kr.start_ns)
         innermost = all_ranges[-1] if all_ranges else None
         if innermost:
             return KernelAttribution(

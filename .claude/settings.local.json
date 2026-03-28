@@ -13,7 +13,11 @@
       "Read(//usr/**)",
       "Bash(/dev/null -name nsys)",
       "Read(//opt/**)",
-      "Read(//usr/bin/**)"
+      "Read(//usr/bin/**)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(python -c \"import torch; print\\(torch.cuda.is_available\\(\\), torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else ''''no gpu''''\\)\")",
+      "Bash(python3:*)"
     ]
   }
 }

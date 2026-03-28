@@ -377,11 +377,13 @@ def main(argv: list[str] | None = None) -> int:
         if skipped_no_text:
             _info(f"Skipped {skipped_no_text} NVTX rows with empty text")
 
-        # Spot-check: query enclosing for the first kernel
-        if kernel_rows:
-            k = kernel_rows[0]
-            enclosing = forest.query_enclosing(k.stream_id, k.device_id, k.start_ns)
-            _info(f"Enclosing ranges for kernel[0] (stream={k.stream_id}): "
+        # Spot-check: query enclosing for the first kernel inside the NVTX window.
+        # NVTX ranges are keyed by host globalTid, not GPU streamId.
+        nvtx_kernels = [k for k in kernel_rows if k.host_tid]
+        if nvtx_kernels:
+            k = nvtx_kernels[0]
+            enclosing = forest.query_enclosing(k.host_tid, k.device_id, k.start_ns)
+            _info(f"Enclosing ranges for kernel[0] (host_tid={k.host_tid}): "
                   f"{[r.text[:50] for r in enclosing] or '(none)'}")
         overall.append(("interval_forest", True))
     except Exception as exc:

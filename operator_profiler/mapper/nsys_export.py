@@ -41,6 +41,9 @@ class KernelRow:
     block_x: int
     block_y: int
     block_z: int
+    # Host thread that launched this kernel (from CUPTI_ACTIVITY_KIND_RUNTIME join).
+    # Used to match NVTX ranges, which are keyed by globalTid, not GPU streamId.
+    host_tid: int = 0
 
 
 @dataclass
@@ -90,20 +93,27 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
         conn.row_factory = sqlite3.Row
         # Column names vary slightly across nsys versions; we use the most
         # common 2023+ schema.  Adapt if columns are absent.
+        #
+        # CUPTI_ACTIVITY_KIND_RUNTIME is joined to retrieve globalTid for each
+        # kernel.  NVTX_EVENTS rows are keyed by globalTid (host thread), not
+        # GPU streamId, so this is the correct key for NVTX enclosure lookups.
         try:
             cursor = conn.execute(
                 """
                 SELECT
                     k.correlationId,
-                    s.value          AS kernel_name,
-                    k.start          AS start_ns,
-                    k.end            AS end_ns,
-                    k.streamId       AS stream_id,
-                    k.deviceId       AS device_id,
+                    s.value                      AS kernel_name,
+                    k.start                      AS start_ns,
+                    k.end                        AS end_ns,
+                    k.streamId                   AS stream_id,
+                    k.deviceId                   AS device_id,
                     k.gridX, k.gridY, k.gridZ,
-                    k.blockX, k.blockY, k.blockZ
+                    k.blockX, k.blockY, k.blockZ,
+                    COALESCE(r.globalTid, 0)     AS host_tid
                 FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
                 LEFT JOIN StringIds AS s ON s.id = k.shortName
+                LEFT JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
+                       ON r.correlationId = k.correlationId
                 ORDER BY k.start ASC
                 """
             )
@@ -112,16 +122,19 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
             cursor = conn.execute(
                 """
                 SELECT
-                    correlationId,
-                    shortName        AS kernel_name,
-                    start            AS start_ns,
-                    end              AS end_ns,
-                    streamId         AS stream_id,
-                    deviceId         AS device_id,
-                    gridX, gridY, gridZ,
-                    blockX, blockY, blockZ
-                FROM CUPTI_ACTIVITY_KIND_KERNEL
-                ORDER BY start ASC
+                    k.correlationId,
+                    k.shortName                  AS kernel_name,
+                    k.start                      AS start_ns,
+                    k.end                        AS end_ns,
+                    k.streamId                   AS stream_id,
+                    k.deviceId                   AS device_id,
+                    k.gridX, k.gridY, k.gridZ,
+                    k.blockX, k.blockY, k.blockZ,
+                    COALESCE(r.globalTid, 0)     AS host_tid
+                FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
+                LEFT JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
+                       ON r.correlationId = k.correlationId
+                ORDER BY k.start ASC
                 """
             )
 
@@ -140,6 +153,7 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
                     block_x=r["blockX"] or 0,
                     block_y=r["blockY"] or 0,
                     block_z=r["blockZ"] or 0,
+                    host_tid=r["host_tid"] or 0,
                 )
             )
 
@@ -153,48 +167,55 @@ def query_nvtx_events(db_path: str | Path) -> list[NvtxRow]:
 
     eventType 59 = NvtxRangeStart/End pairs (the common aten:: ranges).
     We include all range types; the caller filters by nesting_level / text.
+
+    Schema note: nsys 2024+ exports dropped the ``nestingLevel`` column and
+    the ``NVTX_DOMAIN`` table.  We probe the schema at runtime and adapt the
+    query so the function works across all supported nsys versions.
     """
     db_path = Path(db_path)
     rows: list[NvtxRow] = []
 
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        try:
-            cursor = conn.execute(
-                """
-                SELECT
-                    n.text,
-                    n.start          AS start_ns,
-                    n.end            AS end_ns,
-                    n.nestingLevel   AS nesting_level,
-                    COALESCE(d.name, 'default') AS domain,
-                    COALESCE(n.globalTid, 0)    AS stream_id,
-                    0                           AS device_id
-                FROM NVTX_EVENTS AS n
-                LEFT JOIN NVTX_DOMAIN AS d ON d.id = n.domainId
-                WHERE n.end IS NOT NULL
-                ORDER BY n.start ASC
-                """
-            )
-        except sqlite3.OperationalError:
-            # Minimal fallback without domain join
-            cursor = conn.execute(
-                """
-                SELECT
-                    text,
-                    start       AS start_ns,
-                    end         AS end_ns,
-                    nestingLevel AS nesting_level,
-                    'default'   AS domain,
-                    0           AS stream_id,
-                    0           AS device_id
-                FROM NVTX_EVENTS
-                WHERE end IS NOT NULL
-                ORDER BY start ASC
-                """
-            )
 
-        for r in cursor.fetchall():
+        # Probe which optional schema elements are present.
+        col_names = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(NVTX_EVENTS)").fetchall()
+        }
+        has_nesting = "nestingLevel" in col_names
+        has_domain_table = bool(
+            conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='NVTX_DOMAIN'"
+            ).fetchone()
+        )
+
+        nesting_expr = "n.nestingLevel" if has_nesting else "0"
+        domain_expr = (
+            "COALESCE(d.name, 'default')" if has_domain_table else "'default'"
+        )
+        domain_join = (
+            "LEFT JOIN NVTX_DOMAIN AS d ON d.id = n.domainId"
+            if has_domain_table
+            else ""
+        )
+
+        sql = f"""
+            SELECT
+                n.text,
+                n.start                      AS start_ns,
+                n.end                        AS end_ns,
+                {nesting_expr}               AS nesting_level,
+                {domain_expr}                AS domain,
+                COALESCE(n.globalTid, 0)     AS stream_id,
+                0                            AS device_id
+            FROM NVTX_EVENTS AS n
+            {domain_join}
+            WHERE n.end IS NOT NULL
+            ORDER BY n.start ASC
+        """
+        for r in conn.execute(sql).fetchall():
             rows.append(
                 NvtxRow(
                     text=r["text"] or "",
