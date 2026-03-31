@@ -22,7 +22,29 @@
       "Bash(ls /workspace/Operator-Profiler/*.txt /workspace/Operator-Profiler/*.toml /workspace/Operator-Profiler/*.cfg)",
       "Bash(nvidia-smi)",
       "Bash(operator-profiler profile:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(grep -r \"RecordFunction\\\\|_profiler\\\\|DispatchKey\\\\|registered_op\\\\|register_op\" /workspace/Operator-Profiler --include=*.py)",
+      "Bash(ls /workspace/Operator-Profiler/*.nsys-rep /workspace/Operator-Profiler/*.manifest.json /workspace/Operator-Profiler/*.sqlite)",
+      "Bash(find /workspace/Operator-Profiler -name *.nsys-rep -o -name *.manifest.json -o -name *.sqlite)",
+      "Bash(sudo apt:*)",
+      "Bash(curl -fsSL \"http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub\")",
+      "Bash(sudo gpg:*)",
+      "Bash(sudo tee:*)",
+      "Bash(export PATH=/usr/local/bin:$PATH)",
+      "Bash(ncu --version)",
+      "Bash(export PATH=/usr/local/bin:/usr/local/cuda-12.8/bin:$PATH)",
+      "Bash(export PATH=/usr/local/cuda-12.8/bin:$PATH)",
+      "Bash(ncu --help)",
+      "Bash(ncu --nvtx --print-summary per-nvtx --metrics gpu__time_duration.sum --target-processes all /usr/bin/python scripts/workload.py)",
+      "Bash(modprobe nvidia:*)",
+      "Bash(nvidia-smi --query-gpu=name,driver_version --format=csv)",
+      "Bash(ncu --nvtx --metrics gpu__time_duration.sum --target-processes all /usr/bin/python -c \"import torch; x=torch.randn\\(128,128,device=''cuda''\\); torch.mm\\(x,x\\); torch.cuda.synchronize\\(\\)\")",
+      "Bash(sudo ncu:*)",
+      "Bash(sudo whoami:*)",
+      "Bash(sudo -l)",
+      "Bash(sudo /usr/local/cuda-12.8/bin/ncu --nvtx --metrics gpu__time_duration.sum /usr/bin/python -c \"import torch; x=torch.randn\\(128,128,device='cuda'\\); torch.mm\\(x,x\\); torch.cuda.synchronize\\(\\)\" 2>&1)",
+      "Bash(nvidia-smi -q)",
+      "Bash(capsh --print)"
     ]
   }
 }

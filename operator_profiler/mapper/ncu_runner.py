@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,6 +46,15 @@ def run_range_replay(config: NcuRangeReplayConfig) -> Path:
     """
     output_path = Path(config.output_path)
 
+    # ncu cannot execute Python scripts directly — prepend the interpreter
+    # if the target is a .py file.
+    script_cmd: list[str] = []
+    script_path = Path(config.script)
+    if script_path.suffix == ".py":
+        script_cmd = [sys.executable, str(script_path)]
+    else:
+        script_cmd = [str(script_path)]
+
     metrics_arg = ",".join(config.metrics)
     cmd = [
         config.ncu_executable,
@@ -55,7 +65,7 @@ def run_range_replay(config: NcuRangeReplayConfig) -> Path:
         "--export", str(output_path),
         "--force-overwrite",
         *config.extra_ncu_args,
-        str(config.script),
+        *script_cmd,
         *config.script_args,
     ]
     log.info(

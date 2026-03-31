@@ -76,12 +76,9 @@ METRIC_POLICIES: list[MetricPolicy] = [
         AggregationOp.SUM,
         "GPU wall time (sequential assumption — use sum)",
     ),
-    MetricPolicy(
-        "smsp__sass_thread_inst_executed.sum",
-        "thread_inst_executed",
-        AggregationOp.SUM,
-        "Thread instructions executed (additive)",
-    ),
+    # NOTE: smsp__sass_thread_inst_executed.sum is NOT supported in
+    # --replay-mode range (ncu restriction); omitted from DEFAULT_NCU_METRICS.
+    # Collect it separately with --replay-mode kernel if needed.
 ]
 
 # Map ncu column name → MetricPolicy for fast lookup

@@ -487,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             _warn("No provenance JSONL — provenance attribution will not fire")
 
-        outlier_ids = builder._detect_warmup_outliers(kernel_rows)
+        outlier_ids = builder._detect_initialization_kernels(kernel_rows, nvtx_rows)
         provenance   = builder._load_provenance()
 
         entries: list[KernelManifestEntry] = []
@@ -497,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             attribution = builder._attribute(kr, forest, provenance)
             is_warmup   = kid in outlier_ids
             if is_warmup:
-                warnings.append(f"{kid} ({kr.kernel_name}): flagged as warm-up outlier")
+                warnings.append(f"{kid} ({kr.kernel_name}): flagged as initialization kernel")
             entries.append(
                 KernelManifestEntry(
                     kernel_id=kid,

@@ -7,9 +7,8 @@ Edge cases addressed here:
                                  never on absolute timestamps across tools.
   #2  CUDA graph replay        — graph manifest lookup for replay kernels.
   #3  Multi-stream             — already handled by interval tree; pass-through.
-  #4  JIT warm-up inflation    — kernels marked warm_up=True in warnings are
-                                 preserved but flagged; excluded from timing by
-                                 the aggregation stage.
+  #4  JIT warm-up inflation    — initialization kernels (pre-NVTX phase) are
+                                 excluded from the operator-kernel mapping entirely.
   #5  Async kernel launch      — GPU-domain timestamps from CUPTI already used;
                                  no host-timestamp enclosure logic here.
   #6  Dynamic shapes           — input shape validation at replay start.
@@ -89,7 +88,12 @@ class AttributionEngine:
         op_groups: dict[str, list[KernelManifestEntry]] = defaultdict(list)
         unattributed: list[KernelRecord] = []
 
+        init_skipped = 0
         for entry in self.manifest.kernels:
+            if entry.kernel_id in self.warmup_kernel_ids:
+                init_skipped += 1
+                continue
+
             method = entry.attribution.method
             ops = entry.attribution.source_operators
 
@@ -111,6 +115,11 @@ class AttributionEngine:
 
         operator_records = self._build_operator_records(op_groups)
 
+        if init_skipped:
+            log.info(
+                "Skipped %d initialization kernel(s) from operator-kernel mapping",
+                init_skipped,
+            )
         log.info(
             "Attribution: %d operators, %d unattributed kernels",
             len(operator_records),
@@ -123,10 +132,10 @@ class AttributionEngine:
     # ------------------------------------------------------------------
 
     def _extract_warmup_ids_from_warnings(self) -> None:
-        """Parse manifest warnings to find warm-up kernel IDs."""
+        """Parse manifest warnings to find initialization kernel IDs."""
         for warning in self.manifest.warnings:
-            if "warm-up outlier" in warning:
-                # Format: "k_NNNNN (kernel_name): flagged as warm-up outlier"
+            if "initialization kernel" in warning or "warm-up outlier" in warning:
+                # Format: "k_NNNNN (kernel_name): flagged as initialization kernel"
                 kid = warning.split(" ")[0]
                 self.warmup_kernel_ids.add(kid)
 

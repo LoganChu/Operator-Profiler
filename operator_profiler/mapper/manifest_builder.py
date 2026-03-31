@@ -18,7 +18,10 @@ Confidence scoring:
 Edge cases handled here:
   #1  Clock domain  — we never join on absolute timestamps across tools.
   #3  Multi-stream  — per-stream interval trees; match only on same (stream, device).
-  #4  JIT warm-up   — detect outlier durations (>10× median), emit warning.
+  #4  JIT warm-up   — kernels before the first NVTX range ran during torch.compile()
+                      initialization; detected via NVTX time boundary and excluded
+                      from the operator-kernel mapping.  Duration-outlier heuristic
+                      (>10× median) used as fallback when no NVTX data is present.
   #7  Fused kernel  — store all enclosing ranges; mark is_fused=True when
                       provenance reports multiple source_ops.
 
@@ -159,13 +162,15 @@ class ManifestBuilder:
         # Step 3: Load provenance sidecar
         provenance = self._load_provenance()
 
-        # Step 4: Detect warm-up outliers (edge case #4)
-        outlier_ids = self._detect_warmup_outliers(kernel_rows)
+        # Step 4: Detect initialization kernels (edge case #4)
+        # Uses NVTX time boundary when available (kernels before the first NVTX
+        # range ran during torch.compile() warm-up, before emit_nvtx() was
+        # active).  Falls back to duration-outlier heuristic if no NVTX data.
+        outlier_ids = self._detect_initialization_kernels(kernel_rows, nvtx_rows)
         if outlier_ids:
             log.warning(
-                "%d kernel(s) flagged as warm-up outliers (duration >%g× median)",
+                "%d kernel(s) flagged as initialization kernels (pre-NVTX phase)",
                 len(outlier_ids),
-                _WARMUP_OUTLIER_RATIO,
             )
 
         # Step 5: Build kernel entries via three-way join
@@ -179,7 +184,7 @@ class ManifestBuilder:
 
             if is_warmup:
                 warnings.append(
-                    f"{kernel_id} ({kr.kernel_name}): flagged as warm-up outlier"
+                    f"{kernel_id} ({kr.kernel_name}): flagged as initialization kernel"
                 )
 
             entries.append(
@@ -380,18 +385,38 @@ class ManifestBuilder:
                 return [op]
         return []
 
-    def _detect_warmup_outliers(self, kernel_rows: list[KernelRow]) -> set[str]:
+    def _detect_initialization_kernels(
+        self, kernel_rows: list[KernelRow], nvtx_rows: list[NvtxRow]
+    ) -> set[str]:
         """
-        Return kernel IDs whose duration is >_WARMUP_OUTLIER_RATIO × the
-        median duration (edge case #4: JIT warm-up inflation).
+        Return kernel IDs for kernels launched before the steady-state phase.
+
+        Strategy:
+          1. If NVTX ranges exist, use the earliest NVTX start timestamp as the
+             boundary between initialization and steady-state.  Kernels whose
+             CPU launch timestamp precedes this boundary ran before emit_nvtx()
+             was active (i.e. during torch.compile() warm-up) and are excluded
+             from the operator-kernel mapping.
+          2. If no NVTX ranges exist (non-NVTX capture), fall back to duration-
+             outlier detection (>_WARMUP_OUTLIER_RATIO × median) as a heuristic.
         """
+        if nvtx_rows:
+            nvtx_window_start = min(r.start_ns for r in nvtx_rows)
+            outliers: set[str] = set()
+            for i, kr in enumerate(kernel_rows):
+                launch_ts = kr.cpu_launch_start_ns if kr.cpu_launch_start_ns else kr.start_ns
+                if launch_ts < nvtx_window_start:
+                    outliers.add(f"k_{i:05d}")
+            return outliers
+
+        # Fallback: duration-based heuristic when no NVTX ranges are present
         if len(kernel_rows) < 3:
             return set()
         durations = [max(0, r.end_ns - r.start_ns) for r in kernel_rows]
         med = statistics.median(durations)
         if med == 0:
             return set()
-        outliers: set[str] = set()
+        outliers = set()
         for i, (row, dur) in enumerate(zip(kernel_rows, durations)):
             if dur > _WARMUP_OUTLIER_RATIO * med:
                 outliers.add(f"k_{i:05d}")

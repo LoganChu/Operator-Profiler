@@ -33,6 +33,28 @@ from operator_profiler.utils.validation import validate_input_shapes
 log = logging.getLogger(__name__)
 
 
+def _canonical_nvtx_name(text: str) -> str:
+    """
+    Return the ncu --nvtx-include filter expression for a full NVTX range text.
+
+    emit_nvtx(record_shapes=True) uses nvtxRangePush/Pop and appends
+    per-invocation metadata:
+        'aten::mm, op_id = 7, sizes = [[16, 512], ...], input_op_ids = [...]'
+
+    ncu filter syntax:
+      - Plain text / glob (no suffix)  → matches NVTX start/end ranges only
+      - Text with ']' suffix           → matches NVTX push/pop ranges
+      - '*' / '?' are glob wildcards
+
+    Strip the per-invocation tail and append '*]' so the pattern matches all
+    push/pop invocations of that operator across all iterations, e.g.:
+        'aten::mm, op_id = 7, ...'  →  'aten::mm*]'
+    """
+    idx = text.find(",")
+    base = text[:idx].strip() if idx > 0 else text.strip()
+    return base + "*]"
+
+
 @dataclass
 class ReplayTarget:
     """One ncu replay run — corresponds to one unique NVTX range."""
@@ -116,25 +138,33 @@ class RangeReplayOrchestrator:
         """
         Collect unique NVTX ranges from the manifest.
 
-        One ReplayTarget per unique (range_text, range_depth) pair.
+        One ReplayTarget per unique canonical operator name.
+
+        emit_nvtx(record_shapes=True) annotates each range as:
+            'aten::mm, op_id = 7, sizes = [[...]], input_op_ids = [...]'
+        Grouping on the full text would create one ncu run per invocation
+        (e.g. 70 runs for 10 iterations × 7 unique mm calls).  We strip
+        everything after the first comma to get the canonical op name
+        ('aten::mm'), then use that as the --nvtx-include filter so one
+        ncu run captures all invocations of that op across all iterations.
         """
-        seen: dict[tuple[str, int], ReplayTarget] = {}
+        seen: dict[str, ReplayTarget] = {}
 
         for entry in self.manifest.kernels:
             a = entry.attribution
             nvtx = a.nvtx_range
             if nvtx is None:
                 continue
-            key = (nvtx.text, nvtx.depth)
-            if key not in seen:
-                seen[key] = ReplayTarget(
-                    range_text=nvtx.text,
+            canonical = _canonical_nvtx_name(nvtx.text)
+            if canonical not in seen:
+                seen[canonical] = ReplayTarget(
+                    range_text=canonical,
                     range_depth=nvtx.depth,
                     kernel_ids=[],
                     is_fused=a.is_fused,
                     fused_source_ops=a.source_operators[1:] if a.is_fused else [],
                 )
-            seen[key].kernel_ids.append(entry.kernel_id)
+            seen[canonical].kernel_ids.append(entry.kernel_id)
 
         return list(seen.values())
 
