@@ -7,15 +7,14 @@ provenance sidecar.
 
 Stages verified (each reported as PASS / FAIL / WARN):
   0. nsys availability check
-  1. nsys profile   — capture inductor_workload.py under nsys (emits provenance
-                      JSONL alongside the .nsys-rep when INDUCTOR_PROVENANCE=1)
+  1. Provenance collection — run collect_provenance.py (no nsys) to write JSONL
+     nsys profile          — run run_workload.py under nsys with emit_nvtx
   2. nsys export    — .nsys-rep → .sqlite
   3. query_kernels  — CUPTI_ACTIVITY_KIND_KERNEL rows
   4. query_nvtx     — NVTX_EVENTS rows  (surfaces schema mismatch bug)
   5. interval forest — per-stream NvtxIntervalForest built from NVTX rows
   6. manifest build  — KernelManifestEntry list (attribution per kernel);
-                       provenance JSONL is loaded here and feeds _attribute()
-                       as the highest-priority confidence level
+                       provenance JSONL feeds _attribute() at highest priority
   7. attribution stats — breakdown by method + confidence; asserts provenance
                          attribution rate > 0 when JSONL was supplied
   8. metric aggregation — AggregatedMetrics per operator
@@ -23,16 +22,15 @@ Stages verified (each reported as PASS / FAIL / WARN):
 Usage:
     python scripts/verify_preprocessing_pipeline.py [--sqlite PATH]
                                                     [--provenance PATH]
-                                                    [--workload eager|inductor]
+                                                    [--workload PATH]
 
 Pass --sqlite to skip stages 0-2 and run from an existing export.
 Pass --provenance to supply a provenance JSONL alongside --sqlite.
-Pass --workload eager to use nvtx_workload.py instead of inductor_workload.py.
+Pass --workload to use a custom workload script (default: scripts/workload.py).
 """
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sqlite3
 import subprocess
@@ -182,8 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory for nsys output files (default: temp dir).",
     )
     parser.add_argument(
-        "--workload", choices=["inductor", "eager"], default="inductor",
-        help="Workload script for nsys capture (default: inductor).",
+        "--workload", metavar="PATH", default=None,
+        help="Path to a workload script exposing get_model_and_input() "
+             "(default: scripts/workload.py).",
     )
     args = parser.parse_args(argv)
 
@@ -219,69 +218,72 @@ def main(argv: list[str] | None = None) -> int:
         # -------------------------------------------------------------------
         # Stage 1 — nsys profile
         # -------------------------------------------------------------------
-        use_inductor = args.workload == "inductor"
-        workload_name = "inductor_workload.py" if use_inductor else "nvtx_workload.py"
-        _header(1, f"nsys profile  ({workload_name})")
-        workload = ROOT / "scripts" / workload_name
-        if not workload.exists():
-            _fail(f"Workload script not found: {workload}")
+        workload_script = Path(args.workload) if args.workload else ROOT / "scripts" / "workload.py"
+        _header(1, f"nsys profile  ({workload_script.name})")
+        if not workload_script.exists():
+            _fail(f"Workload script not found: {workload_script}")
             overall.append(("nsys profile", False))
             return _print_summary(overall)
 
         out_dir = Path(args.output_dir) if args.output_dir else Path(tempfile.mkdtemp(prefix="op_profiler_"))
         out_dir.mkdir(parents=True, exist_ok=True)
-        stem = "inductor_workload" if use_inductor else "nvtx_workload"
+        stem = workload_script.stem
         rep_path = out_dir / f"{stem}.nsys-rep"
         sqlite_path = out_dir / f"{stem}.sqlite"
 
-        # For the inductor workload, collect provenance JSONL in a plain Python
-        # subprocess (no nsys) BEFORE the nsys session starts.  Running
-        # torch.profiler inside nsys causes a CUPTI conflict where nsys
-        # intercepts the activity buffers and torch.profiler sees zero CUDA
-        # events — the JSONL would be empty.  Running it first avoids that.
-        run_env = os.environ.copy()
-        if use_inductor:
-            prov_out = out_dir / f"{stem}.provenance.jsonl"
-            prov_env = run_env.copy()
-            prov_env["INDUCTOR_PROVENANCE"]        = "1"
-            prov_env["INDUCTOR_COMPILE_THREADS"]   = "1"
-            prov_env["INDUCTOR_PROVENANCE_OUTPUT"] = str(prov_out)
-            prov_cmd = [sys.executable, str(workload), "--provenance-only"]
-            _info(f"Provenance collection (no nsys): {' '.join(prov_cmd)}")
-            _info(f"Provenance JSONL target: {prov_out.name}")
-            try:
-                prov_result = subprocess.run(
-                    prov_cmd, capture_output=True, text=True,
-                    timeout=120, env=prov_env,
-                )
-                if prov_result.returncode != 0:
-                    _warn(f"Provenance collection exited {prov_result.returncode} "
-                          "— provenance attribution will not fire in stage 6")
-                    _info(prov_result.stderr[-400:] if prov_result.stderr else "(no stderr)")
-                elif prov_out.exists() and prov_out.stat().st_size > 0:
-                    provenance_path = prov_out
-                    _ok(f"Provenance JSONL written: {prov_out.name} "
-                        f"({prov_out.stat().st_size} bytes)")
-                else:
-                    _warn("Provenance JSONL empty after collection step — "
-                          "torch.profiler captured no CUDA events")
-            except subprocess.TimeoutExpired:
-                _warn("Provenance collection timed out — skipping")
-            except Exception as exc:
-                _warn(f"Provenance collection error: {exc}")
+        # Collect provenance JSONL in a plain Python subprocess (no nsys)
+        # BEFORE the nsys session starts.  Running torch.profiler inside nsys
+        # causes a CUPTI conflict where nsys intercepts the activity buffers
+        # and torch.profiler sees zero CUDA events.  Running it first avoids that.
+        prov_out = out_dir / f"{stem}.provenance.jsonl"
+        prov_cmd = [
+            sys.executable,
+            str(ROOT / "scripts" / "collect_provenance.py"),
+            "--workload", str(workload_script),
+            "--output", str(prov_out),
+            "--compile-backend", "inductor",
+            "--warmup-iters", "5",
+        ]
+        _info(f"Provenance collection (no nsys): {' '.join(prov_cmd)}")
+        _info(f"Provenance JSONL target: {prov_out.name}")
+        try:
+            prov_result = subprocess.run(
+                prov_cmd, capture_output=True, text=True,
+                timeout=120,
+            )
+            if prov_result.returncode != 0:
+                _warn(f"Provenance collection exited {prov_result.returncode} "
+                      "— provenance attribution will not fire in stage 6")
+                _info(prov_result.stderr[-400:] if prov_result.stderr else "(no stderr)")
+            elif prov_out.exists() and prov_out.stat().st_size > 0:
+                provenance_path = prov_out
+                _ok(f"Provenance JSONL written: {prov_out.name} "
+                    f"({prov_out.stat().st_size} bytes)")
+            else:
+                _warn("Provenance JSONL empty after collection step — "
+                      "torch.profiler captured no CUDA events")
+        except subprocess.TimeoutExpired:
+            _warn("Provenance collection timed out — skipping")
+        except Exception as exc:
+            _warn(f"Provenance collection error: {exc}")
 
         cmd = [
             "nsys", "profile",
             "--trace=cuda,nvtx",
             f"--output={out_dir / stem}",
             "--force-overwrite=true",
-            sys.executable, str(workload),
+            sys.executable,
+            str(ROOT / "scripts" / "run_workload.py"),
+            "--workload", str(workload_script),
+            "--compile-backend", "inductor",
+            "--warmup-iters", "5",
         ]
+
         _info(f"cmd: {' '.join(cmd)}")
         t0 = time.perf_counter()
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300, env=run_env,
+                cmd, capture_output=True, text=True, timeout=300,
             )
             elapsed = time.perf_counter() - t0
             if result.returncode != 0:
@@ -464,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         meta = CaptureManifestMetadata(
             model_name="TransformerBlock",
             torch_version=torch.__version__,
-            compile_mode="eager",
+            compile_mode="inductor",
             nsys_report_path=str(sqlite_path),
             capture_timestamp_utc=_time.strftime("%Y-%m-%dT%H:%M:%S+00:00", _time.gmtime()),
         )
@@ -533,40 +535,51 @@ def main(argv: list[str] | None = None) -> int:
         _fail("No manifest — skipping attribution stats")
         overall.append(("attribution_stats", False))
     else:
-        method_counts: Counter = Counter()
-        conf_counts:   Counter = Counter()
-        for e in manifest.kernels:
-            method_counts[e.attribution.method.value] += 1
-            conf_counts[e.attribution.confidence.value] += 1
+        # Split kernels into warmup (outlier) and capture sets.
+        # Warmup kernels run before emit_nvtx is active, so they will never
+        # receive NVTX attribution — counting them in the denominator makes
+        # NVTX match rate appear much lower than it really is.
+        warmup_entries  = [e for e in manifest.kernels if e.kernel_id in outlier_ids]
+        capture_entries = [e for e in manifest.kernels if e.kernel_id not in outlier_ids]
 
-        total = len(manifest.kernels)
-        _ok(f"Total kernels: {total}")
-        _info("Attribution method breakdown:")
-        for method, cnt in sorted(method_counts.items(), key=lambda x: -x[1]):
-            pct = 100 * cnt / total if total else 0
-            _info(f"    {method:<20}  {cnt:>7}  ({pct:.1f}%)")
-        _info("Confidence breakdown:")
-        for conf, cnt in sorted(conf_counts.items(), key=lambda x: -x[1]):
-            pct = 100 * cnt / total if total else 0
-            _info(f"    {conf:<20}  {cnt:>7}  ({pct:.1f}%)")
+        def _breakdown(label: str, entries: list) -> dict[str, int]:
+            total = len(entries)
+            if total == 0:
+                _info(f"{label}: 0 kernels")
+                return {}
+            mc: Counter = Counter()
+            for e in entries:
+                mc[e.attribution.method.value] += 1
+            _info(f"{label} ({total} kernels):")
+            for method, cnt in sorted(mc.items(), key=lambda x: -x[1]):
+                pct = 100 * cnt / total
+                _info(f"    {method:<20}  {cnt:>6}  ({pct:.1f}%)")
+            return mc
 
-        prov_pct = 100 * method_counts.get("provenance", 0) / total if total else 0
-        nvtx_pct = 100 * method_counts.get("nvtx", 0) / total if total else 0
-        heur_pct = 100 * method_counts.get("name_heuristic", 0) / total if total else 0
-        unat_pct = 100 * method_counts.get("unattributed", 0) / total if total else 0
+        _ok(f"Total kernels: {len(manifest.kernels)}  "
+            f"(capture={len(capture_entries)}, warmup-outlier={len(warmup_entries)})")
+        capture_mc = _breakdown("Capture kernels (emit_nvtx window)", capture_entries)
+        if warmup_entries:
+            _breakdown("Warmup / pre-emit_nvtx kernels", warmup_entries)
+
+        total_cap = len(capture_entries)
+        prov_pct = 100 * capture_mc.get("provenance", 0) / total_cap if total_cap else 0
+        nvtx_pct = 100 * capture_mc.get("nvtx", 0) / total_cap if total_cap else 0
+        heur_pct = 100 * capture_mc.get("name_heuristic", 0) / total_cap if total_cap else 0
+        unat_pct = 100 * capture_mc.get("unattributed", 0) / total_cap if total_cap else 0
 
         stats_passed = True
 
         # Provenance: assert > 0% when JSONL was supplied
         if builder.provenance_jsonl_path:
             if prov_pct > 0:
-                _ok(f"Provenance attribution rate: {prov_pct:.1f}%")
-                fused_count = sum(1 for e in manifest.kernels if e.attribution.is_fused)
-                loc_count   = sum(1 for e in manifest.kernels if e.attribution.source_locations)
+                _ok(f"Provenance attribution rate (capture): {prov_pct:.1f}%")
+                fused_count = sum(1 for e in capture_entries if e.attribution.is_fused)
+                loc_count   = sum(1 for e in capture_entries if e.attribution.source_locations)
                 _info(f"Fused kernels (is_fused=True): {fused_count}")
                 _info(f"Kernels with source_locations: {loc_count}")
             else:
-                _fail("Provenance JSONL was loaded but zero kernels got PROVENANCE "
+                _fail("Provenance JSONL was loaded but zero capture kernels got PROVENANCE "
                       "attribution — likely a kernel name mismatch between "
                       "torch.profiler event names and nsys shortName values")
                 stats_passed = False
@@ -574,10 +587,10 @@ def main(argv: list[str] | None = None) -> int:
             _info(f"Provenance: {prov_pct:.1f}% (no JSONL supplied — expected 0%)")
 
         if nvtx_pct > 0:
-            _ok(f"NVTX attribution rate: {nvtx_pct:.1f}%")
+            _ok(f"NVTX attribution rate (capture kernels): {nvtx_pct:.1f}%")
         else:
-            _warn("Zero NVTX attributions — NVTX ranges may not overlap kernels "
-                  "(GPU vs CPU timestamp domain mismatch or empty NVTX data)")
+            _warn("Zero NVTX attributions in capture window — check that emit_nvtx "
+                  "ranges overlap the kernel timestamps in the nsys trace")
         _info(f"Name heuristic: {heur_pct:.1f}%   Unattributed: {unat_pct:.1f}%")
         overall.append(("attribution_stats", stats_passed))
 

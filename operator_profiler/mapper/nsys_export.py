@@ -44,6 +44,10 @@ class KernelRow:
     # Host thread that launched this kernel (from CUPTI_ACTIVITY_KIND_RUNTIME join).
     # Used to match NVTX ranges, which are keyed by globalTid, not GPU streamId.
     host_tid: int = 0
+    # CPU-side timestamp of the cuLaunchKernel() call from RUNTIME table.
+    # NVTX ranges use CPU timestamps; GPU start_ns is always slightly later due
+    # to async dispatch.  Use cpu_launch_start_ns for NVTX enclosure queries.
+    cpu_launch_start_ns: int = 0
 
 
 @dataclass
@@ -109,7 +113,8 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
                     k.deviceId                   AS device_id,
                     k.gridX, k.gridY, k.gridZ,
                     k.blockX, k.blockY, k.blockZ,
-                    COALESCE(r.globalTid, 0)     AS host_tid
+                    COALESCE(r.globalTid, 0)     AS host_tid,
+                    COALESCE(r.start, 0)         AS cpu_launch_start_ns
                 FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
                 LEFT JOIN StringIds AS s ON s.id = k.shortName
                 LEFT JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
@@ -130,7 +135,8 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
                     k.deviceId                   AS device_id,
                     k.gridX, k.gridY, k.gridZ,
                     k.blockX, k.blockY, k.blockZ,
-                    COALESCE(r.globalTid, 0)     AS host_tid
+                    COALESCE(r.globalTid, 0)     AS host_tid,
+                    COALESCE(r.start, 0)         AS cpu_launch_start_ns
                 FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
                 LEFT JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS r
                        ON r.correlationId = k.correlationId
@@ -154,6 +160,7 @@ def query_kernels(db_path: str | Path) -> list[KernelRow]:
                     block_y=r["blockY"] or 0,
                     block_z=r["blockZ"] or 0,
                     host_tid=r["host_tid"] or 0,
+                    cpu_launch_start_ns=r["cpu_launch_start_ns"] or 0,
                 )
             )
 
